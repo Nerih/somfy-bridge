@@ -14,36 +14,26 @@ import sys
 import signal
 
 from config import (
-     MQTT_SOMFY_PREFIX, MQTT_BRIDGE_WILL
+     MQTT_SOMFY_PREFIX, MQTT_BRIDGE_WILL,LOG_LEVEL,SDN_HOST,DDNG_HOST,TCP_PORT,
+     READ_TIMEOUT,RECONNECT_DELAY,MAX_RECONNECT_DELAY,MAX_BUFFER,SEND_RATE_LIMIT,KEEPALIVE_INTERVAL,
+     KEEPALIVE_TIMEOUT
 )
 
 # ───────────────────────────────────────────────
 # Logging setup
 # ───────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format='%(asctime)s.%(msecs)03d %(message)s',
     datefmt='%H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("🔌 SDNBridge")
 
-# ───────────────────────────────────────────────
-# Config
-# ───────────────────────────────────────────────
 PORTS = {
-    "192.168.0.221": "SDN",
-    "192.168.0.222": "DDNG"
+    SDN_HOST: "SDN",
+    DDNG_HOST: "DDNG"
 }
-
-TCP_PORT = 4196
-READ_TIMEOUT = 0.6
-RECONNECT_DELAY = 5.0
-MAX_RECONNECT_DELAY = 60.0  # Maximum delay between reconnection attempts
-MAX_BUFFER = 2048
-SEND_RATE_LIMIT = 20
-KEEPALIVE_INTERVAL = 30.0  # Send keepalive every 30 seconds
-KEEPALIVE_TIMEOUT = 10.0   # Wait 10 seconds for keepalive response
 
 
 class AsyncConnection:
