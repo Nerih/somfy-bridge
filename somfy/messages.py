@@ -597,6 +597,29 @@ class SetNetworkLock(Message):
     def params(self):
         return transform_param([1 if self.locked else 0, self.priority])
 
+class SetNodeDiscovery(Message):
+    MSG = 0x50
+    PARAMS_LENGTH = 1
+    DISCOVERY = {"startDiscovery": 0x00, "endDiscovery": 0x01}
+
+    def __init__(self, discovery="startDiscovery", **kwargs):
+        super().__init__(**kwargs)
+        if discovery not in self.DISCOVERY:
+            logger.warning(f"⚠️ SetNodeDiscovery.__init__: invalid '{discovery}', defaulting to 'startDiscovery'")
+            discovery = "startDiscovery"
+        self.discovery = discovery
+
+    def parse(self, params):
+        # params is 1 byte (obfuscated). to_number(params) returns the de-obfuscated value.
+        self.discovery = invert_dict(self.DISCOVERY).get(to_number(params))
+
+    def params(self):
+        # Correctly map the current selection to its opcode
+        code = self.DISCOVERY.get(self.discovery, self.DISCOVERY["startDiscovery"])
+        return transform_param([code])
+
+
+
 # --- SET NODE LABEL ---
 class SetNodeLabel(Message):
     MSG = 0x55

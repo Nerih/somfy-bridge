@@ -4,19 +4,27 @@ Hardened Dual Serial SDN Bridge with Queued Forwarding, Reconnects, and Emoji Lo
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Optional, Callable, List
 from queue import Queue
+from mqtt.discovery import sdn_cover_payload, sdn_name_payload
 from somfy.protocol import *
 import somfy.messages  # Auto-register message
+from somfy.messages import GetNodeAddr, GetNodeLabel, PostNodeAddr, PostNodeLabel
+
 import sys
 import signal
 
+from mqtt.mqtt_handlers import start_mqtt, set_asyncio_scheduler, set_send_to_sdn, set_mqtt_publish_fn
+
+
+
 from config import (
-     MQTT_SOMFY_PREFIX, MQTT_BRIDGE_WILL,LOG_LEVEL,SDN_HOST,DDNG_HOST,TCP_PORT,
+     LOG_LEVEL,SDN_HOST,DDNG_HOST,TCP_PORT,
      READ_TIMEOUT,RECONNECT_DELAY,MAX_RECONNECT_DELAY,MAX_BUFFER,SEND_RATE_LIMIT,KEEPALIVE_INTERVAL,
-     KEEPALIVE_TIMEOUT
+     KEEPALIVE_TIMEOUT,CONFIG_PORT
 )
 
 # ───────────────────────────────────────────────
@@ -65,6 +73,11 @@ class AsyncConnection:
                 self.current_delay = RECONNECT_DELAY
                 logger.info(f"✅ {self.label} connected to {self.ip}:{TCP_PORT}")
 
+                #area to handle any startup code
+                #
+                # if self.label == "SDN":
+                #   asyncio.create_task(run_sdn_discovery())
+
                 tasks = [
                     asyncio.create_task(self.listen_loop()),
                     asyncio.create_task(self.send_loop()),
@@ -111,7 +124,7 @@ class AsyncConnection:
                 try:
                     # Add timeout to read operation
                     chunk = await asyncio.wait_for(
-                        self.reader.read(1024), 
+                        self.reader.read(MAX_BUFFER), 
                         timeout=READ_TIMEOUT
                     )
                     if not chunk:
@@ -207,10 +220,12 @@ class AsyncConnection:
                 else:
                     if len(self.buffer) < 11:
                         break
-                    self.buffer.pop(0)
+                    if self.buffer:
+                        self.buffer.pop(0)
             except Exception as e:
                 logger.warning(f"⚠️ {self.label} parse error: {e}")
-                self.buffer.pop(0)
+                if self.buffer:
+                    self.buffer.pop(0)
 
     def send(self, msg: Message):
         if not self._connected.is_set():
@@ -242,6 +257,10 @@ class Bridge:
     def __init__(self):
         Bridge.instance = self
         self.connections = {}
+        self._mqtt_publish = None  # (topic, payload:str, retain:bool)->None
+
+    def set_mqtt_publish(self, fn):
+        self._mqtt_publish = fn
 
     async def start(self):
         tasks = []
@@ -255,6 +274,12 @@ class Bridge:
         for conn in self.connections.values():
             conn.stop()
 
+    def send_to_sdn(self, msg: Message):
+        if "SDN" in self.connections:
+            self.connections["SDN"].send(msg)
+  
+
+    #handles all messages from bus
     async def forward_message(self, msg: Message, source_label: str):
         if isinstance(msg, UnknownMessage):
             logger.warning(f"⚠️ {source_label} Skipping unknown message: {msg}")
@@ -270,7 +295,41 @@ class Bridge:
 
         if target in self.connections:
             self.connections[target].send(msg)
+            
+        #handle sends to MQTT
+        if self._mqtt_publish and source_label == "SDN":
+            topic = f"somfy"
+            #handle bus
+            payload = self.serialize_msg(msg)   # helper below
+            self._mqtt_publish(topic, payload, retain=False)   
+            #handle initial discovery messages, and set up getnamelbl button
+            if dest == [0xFF, 0xFF, 0xF1] and isinstance(msg, PostNodeAddr):  
+               
+                cover_payload, cover_topic = sdn_cover_payload(msg)
+                logger.info(f"🔍 Publishing cover: {cover_topic} for {print_address(msg.src)}")                
+                self._mqtt_publish(cover_topic, json.dumps(cover_payload), retain=True)   
+        
+                name_payload, name_topic = sdn_name_payload(msg)
+                self._mqtt_publish(name_topic, json.dumps(name_payload), retain=True)   
 
+                
+                
+                return
+
+                name_msg = GetNodeLabel()
+                name_msg.src_node_type =0
+                name_msg.src =[0xFF, 0xFF, 0xF1]
+                name_msg.ack_requested = False
+                name_msg.dest = msg.src
+                logger.info(f"🔍 Get Name: {name_msg}")
+                Bridge.instance.send_to_sdn(name_msg)  # send to SDN only
+                
+            #handle getting the name, and publish MQTT discovery for each motor
+            if dest == [0xFF, 0xFF, 0xF1] and isinstance(msg, PostNodeLabel):  
+                cover_payload, cover_topic = sdn_cover_payload(msg,msg.label)
+                logger.info(f"🔍 Setting Node Label to: {msg.label} for {print_address(msg.src)}")
+                self._mqtt_publish(cover_topic, json.dumps(cover_payload), retain=True)   
+                
     def remap_node_type(self, msg: Message, label: str):
         try:
             if label == "DDNG" and msg.des_node_type == 2:
@@ -282,10 +341,55 @@ class Bridge:
             logger.error(f"⚠️  Remap error: {e}")
         return msg
 
+    def serialize_msg(self, msg: Message) -> str:
+        """Turn an SDN Message into JSON string for MQTT publish."""
+        try:
+            return json.dumps({
+                "ts": datetime.now().isoformat(),
+                "type": msg.__class__.__name__,
+                "src": getattr(msg, "src", None),
+                "dest": getattr(msg, "dest", None),
+                "src_node_type": getattr(msg, "src_node_type", None),
+                "des_node_type": getattr(msg, "des_node_type", None),
+                "ack_requested": getattr(msg, "ack_requested", None),
+                "raw": msg.to_bytes().hex().upper()
+            })
+        except Exception as e:
+            return json.dumps({"error": f"serialize_failed: {e}"})
+
+async def run_sdn_discovery():
+    logger.info("🔍 Starting SDN Discovery...")
+    msg = GetNodeAddr()
+    msg.src_node_type =0
+    msg.src =[0xFF, 0xFF, 0xF1]
+    msg.ack_requested = True
+    Bridge.instance.send_to_sdn(msg)  # send to SDN only
+    logger.info(f"📤 Sent GetNodeAddr from src {msg.src}")
+    logging.info("✅ Discovery finished.")
+
 async def main():
+
+    #Start Bridge
     bridge = Bridge()
     try:
-        await bridge.start()
+        bridge_task = asyncio.create_task(bridge.start())
+        
+        publisher = start_mqtt()  # just call it, don’t await
+        
+        loop = asyncio.get_running_loop()
+        # MQTT thread → asyncio loop scheduler
+        set_asyncio_scheduler(lambda coro_fn, *a, **k: asyncio.run_coroutine_threadsafe(coro_fn(*a, **k), loop))
+        # Allow MQTT handler to push to SDN
+        set_send_to_sdn(lambda msg: Bridge.instance.send_to_sdn(msg))
+        # Allow Bridge to publish SDN messages out to MQTT
+        set_mqtt_publish_fn(lambda topic, payload, retain=False: publisher.publish(topic, payload, retain=retain))       
+        
+        bridge.set_mqtt_publish(lambda topic, payload, retain=False: publisher.publish(topic, payload, retain=retain))
+
+
+        await bridge_task
+
+
     except KeyboardInterrupt:
         print("🛑 Caught Ctrl+C, stopping...")
         await bridge.stop()
