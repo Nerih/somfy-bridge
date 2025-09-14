@@ -143,13 +143,25 @@ def node_type_to_number(type_input):
 # Add this helper (e.g., near the Bridge class)
 def is_unicast_non_group(dest: List[int]) -> bool:
     """
-    Treat first 3 bytes of dest as a 20-bit-ish node address.
-    Return True for 0x000001–0x0FFFFF and False for group/broadcast (e.g., FF FF F*).
+    Return True if dest is a true unicast (not group/broadcast).
+    
+    Rules:
+      • Group addresses are in 0x0_0001 – 0x0_FFFF (leading nibble 0x0).
+      • Broadcast/group patterns like FF FF F* are excluded.
+      • Unicast = anything else in 0x100000 – 0xFFFFFE.
     """
     if not dest or len(dest) < 3:
         return False
-    # Exclude broadcast/group like FF FF F0 / FF FF xx
+
+    # Reject broadcast / group patterns like FF FF F*
     if dest[0] == 0xFF and dest[1] == 0xFF:
         return False
+
     addr = (dest[0] << 16) | (dest[1] << 8) | dest[2]
-    return 0x000001 <= addr <= 0x0FFFFF
+
+    # Group = 0x000001–0x0FFFFF
+    if 0x000001 <= addr <= 0x0FFFFF:
+        return False
+
+    # Everything else (up to 0xFFFFFF) is unicast
+    return 0x000001 <= addr <= 0xFFFFFF

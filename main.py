@@ -17,7 +17,7 @@ import sys
 import signal
 
 from config import (
-     ACK_MAX_RETRIES, ACK_RETRY_INTERVAL, MQTT_SOMFY_PREFIX, MQTT_BRIDGE_WILL,LOG_LEVEL,SDN_HOST,DDNG_HOST,TCP_PORT,
+     ACK_MAX_RETRIES, ACK_RESPONSE_TIMEOUT, ACK_RETRY_DELAY, ACK_TOTAL_WINDOW, MQTT_SOMFY_PREFIX, MQTT_BRIDGE_WILL,LOG_LEVEL,SDN_HOST,DDNG_HOST,TCP_PORT,
      READ_TIMEOUT,RECONNECT_DELAY,MAX_RECONNECT_DELAY,MAX_BUFFER,SEND_RATE_LIMIT,KEEPALIVE_INTERVAL,
      KEEPALIVE_TIMEOUT
 )
@@ -263,28 +263,27 @@ class Bridge:
     async def forward_message(self, msg: Message, source_label: str):
         # ---------- Helpers ----------
         def _key_for_ackish(m: Message):
-            # ACK/NACK swap src/dest vs the original outgoing
             return (tuple(getattr(m, "dest", []) or []),
                     tuple(getattr(m, "src", []) or []))
 
-        from somfy.messages import Ack, Nack, UnknownMessage
-
-        # ---------- ACK / NACK handling ----------
-        if isinstance(msg, (Ack, Nack)):
-            key = (tuple(getattr(msg, "dest", []) or []),
-                tuple(getattr(msg, "src", []) or []))  # swapped for response
-
+        # ---------- ACK / NACK handling (opcode-based) ----------
+        msg_code = getattr(msg, "MSG", None)
+        if msg_code in (0x7F, 0x6F):  # Ack or Nack, regardless of class identity
+            key = _key_for_ackish(msg)
             event = self.pending_acks.get(key)
             if event:
-                event.set()  # ACK or NACK both fulfil the wait
+                event.set()  # satisfy waiters
                 self.pending_acks.pop(key, None)
                 logger.info(f"🟢 ACK/NACK matched pending send {key}")
             else:
-                logger.debug(f"ℹ️ ACK/NACK with no pending match: "
-                            f"src={getattr(msg,'src',None)} dest={getattr(msg,'dest',None)}")
+                logger.debug(
+                    f"ℹ️ ACK/NACK with no pending match: "
+                    f"src={getattr(msg,'src',None)} dest={getattr(msg,'dest',None)}"
+                )
             return  # do not forward ACK/NACK
 
         # ---------- Non-ACK path ----------
+        from somfy.protocol import UnknownMessage  # safe import location
         if isinstance(msg, UnknownMessage):
             logger.warning(f"⚠️ {source_label} Skipping unknown message: {msg}")
             return
@@ -312,29 +311,53 @@ class Bridge:
         else:
             target_conn.send(msg)
 
+
     # In Bridge.send_with_ack — always create a fresh Event, optional NACK handling
     async def send_with_ack(self, conn: AsyncConnection, msg: Message):
         key = (tuple(msg.src), tuple(msg.dest))
-        async with self.pending_locks[key]:   # serialize per key
+        async with self.pending_locks[key]:   # serialize per (src,dest)
             event = asyncio.Event()
             self.pending_acks[key] = event
+            start = asyncio.get_event_loop().time()
+
             try:
-                # (rest unchanged)
-                for attempt in range(ACK_MAX_RETRIES):
+                for attempt in range(1, ACK_MAX_RETRIES + 1):
+                    # Stop if we've exceeded the total window
+                    elapsed = asyncio.get_event_loop().time() - start
+                    if elapsed >= ACK_TOTAL_WINDOW:
+                        logger.error(f"⏱️ Total ACK window exceeded for {key} after {elapsed:.3f}s")
+                        return False
+
+                    # Send
                     conn.send(msg)
+                    if attempt == 1:
+                        # Helpful once-per-message trace
+                        try:
+                            raw = msg.to_bytes().hex().upper()
+                            logger.debug(f"📤 TX {key} (attempt {attempt}/{ACK_MAX_RETRIES}) bytes={raw}")
+                        except Exception:
+                            pass
+                    else:
+                        logger.debug(f"📤 TX {key} (attempt {attempt}/{ACK_MAX_RETRIES})")
+
+                    # Wait up to the per-attempt timeout, but don’t overrun the total window
+                    remaining = ACK_TOTAL_WINDOW - (asyncio.get_event_loop().time() - start)
+                    timeout = max(0.0, min(ACK_RESPONSE_TIMEOUT, remaining))
                     try:
-                        await asyncio.wait_for(event.wait(), timeout=ACK_RETRY_INTERVAL)
-                        logger.info(f"✅ ACK/NACK seen for {key} after {attempt+1} attempt(s)")
+                        await asyncio.wait_for(event.wait(), timeout=timeout)
+                        logger.info(f"✅ ACK/NACK for {key} after {attempt} attempt(s)")
                         return True
                     except asyncio.TimeoutError:
-                        if attempt == 0:
-                            try:
-                                raw = msg.to_bytes().hex().upper()
-                                logger.debug(f"🔁 First retry payload for {key}: {raw}")
-                            except Exception:
-                                pass
-                        logger.debug(f"⏰ No ACK/NACK yet for {key}, retry {attempt+1}/{ACK_MAX_RETRIES}")
-                logger.error(f"❌ No ACK/NACK after {ACK_MAX_RETRIES} attempts for {key}")
+                        # No ACK yet; optionally pause before retrying
+                        if ACK_RETRY_DELAY > 0:
+                            # ensure we don't overrun the total window during delay
+                            remaining = ACK_TOTAL_WINDOW - (asyncio.get_event_loop().time() - start)
+                            if remaining <= 0:
+                                break
+                            await asyncio.sleep(min(ACK_RETRY_DELAY, remaining))
+                        # and loop to retry
+
+                logger.error(f"❌ No ACK/NACK for {key} after {ACK_MAX_RETRIES} attempts within {ACK_TOTAL_WINDOW:.3f}s")
                 return False
             finally:
                 self.pending_acks.pop(key, None)
