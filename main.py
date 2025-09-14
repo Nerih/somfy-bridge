@@ -10,6 +10,8 @@ from typing import Optional, Callable, List
 from queue import Queue
 from somfy.helpers import is_unicast_non_group
 from somfy.protocol import *
+from collections import defaultdict
+
 import somfy.messages  # Auto-register message
 import sys
 import signal
@@ -244,6 +246,7 @@ class Bridge:
         Bridge.instance = self
         self.connections = {}
         self.pending_acks = {}   # message_id -> asyncio.Event
+        self.pending_locks = defaultdict(asyncio.Lock)  # per (src,dest)
 
     async def start(self):
         tasks = []
@@ -268,18 +271,17 @@ class Bridge:
 
         # ---------- ACK / NACK handling ----------
         if isinstance(msg, (Ack, Nack)):
-            key = _key_for_ackish(msg)
+            key = (tuple(getattr(msg, "dest", []) or []),
+                tuple(getattr(msg, "src", []) or []))  # swapped for response
+
             event = self.pending_acks.get(key)
             if event:
-                event.set()
+                event.set()  # ACK or NACK both fulfil the wait
                 self.pending_acks.pop(key, None)
-                if isinstance(msg, Ack):
-                    logger.info(f"🟢 ACK matched pending send {key}")
-                else:
-                    logger.warning(f"🟠 NACK matched pending send {key}")
+                logger.info(f"🟢 ACK/NACK matched pending send {key}")
             else:
-                tag = "ACK" if isinstance(msg, Ack) else "NACK"
-                logger.debug(f"ℹ️ {tag} with no pending match: src={getattr(msg,'src',None)} dest={getattr(msg,'dest',None)}")
+                logger.debug(f"ℹ️ ACK/NACK with no pending match: "
+                            f"src={getattr(msg,'src',None)} dest={getattr(msg,'dest',None)}")
             return  # do not forward ACK/NACK
 
         # ---------- Non-ACK path ----------
@@ -310,58 +312,58 @@ class Bridge:
         else:
             target_conn.send(msg)
 
-
+    # In Bridge.send_with_ack — always create a fresh Event, optional NACK handling
     async def send_with_ack(self, conn: AsyncConnection, msg: Message):
-        """
-        Retry send until ACK/NACK observed or attempts exhausted.
-        Keys pending_acks by (src_tuple, dest_tuple) to match forward_message().
-        """
         key = (tuple(msg.src), tuple(msg.dest))
-
-        # Register (or reuse) the event before first transmit
-        event = self.pending_acks.get(key)
-        if event is None:
+        async with self.pending_locks[key]:   # serialize per key
             event = asyncio.Event()
             self.pending_acks[key] = event
+            try:
+                # (rest unchanged)
+                for attempt in range(ACK_MAX_RETRIES):
+                    conn.send(msg)
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=ACK_RETRY_INTERVAL)
+                        logger.info(f"✅ ACK/NACK seen for {key} after {attempt+1} attempt(s)")
+                        return True
+                    except asyncio.TimeoutError:
+                        if attempt == 0:
+                            try:
+                                raw = msg.to_bytes().hex().upper()
+                                logger.debug(f"🔁 First retry payload for {key}: {raw}")
+                            except Exception:
+                                pass
+                        logger.debug(f"⏰ No ACK/NACK yet for {key}, retry {attempt+1}/{ACK_MAX_RETRIES}")
+                logger.error(f"❌ No ACK/NACK after {ACK_MAX_RETRIES} attempts for {key}")
+                return False
+            finally:
+                self.pending_acks.pop(key, None)
 
+
+
+
+    def remap_node_type(self, msg: Message, label: str):
         try:
-            for attempt in range(ACK_MAX_RETRIES):
-                conn.send(msg)
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=ACK_RETRY_INTERVAL)
-                    logger.info(f"✅ ACK/NACK seen for {key} after {attempt+1} attempt(s)")
-                    return True
-                except asyncio.TimeoutError:
-                    logger.debug(f"⏰ No ACK yet for {key}, retry {attempt+1}/{ACK_MAX_RETRIES}")
-            logger.error(f"❌ No ACK after {ACK_MAX_RETRIES} attempts for {key}")
-            return False
-        finally:
-            # Clean up regardless of success/failure to avoid leaks
-            self.pending_acks.pop(key, None)
+            # DDNG → SDN: remap node type 2 → 0
+            if label == "DDNG" and msg.des_node_type == 2:
+                msg.des_node_type = 0
 
+                # Only request ACK (to trigger reliable send step 5) for non-group/unicast
+                if is_unicast_non_group(msg.dest):
+                    msg.ack_requested = True
+                    logger.debug(f"🔁 Remap DDNG→SDN: unicast {msg.dest} → ACK ON")
+                else:
+                    # Ensure we don't force ACKs on group/broadcast
+                    msg.ack_requested = False
+                    logger.debug(f"🔁 Remap DDNG→SDN: group/broadcast {msg.dest} → ACK OFF")
 
-            def remap_node_type(self, msg: Message, label: str):
-                try:
-                    # DDNG → SDN: remap node type 2 → 0
-                    if label == "DDNG" and msg.des_node_type == 2:
-                        msg.des_node_type = 0
-
-                        # Only request ACK (to trigger reliable send step 5) for non-group/unicast
-                        if is_unicast_non_group(msg.dest):
-                            msg.ack_requested = True
-                            logger.debug(f"🔁 Remap DDNG→SDN: unicast {msg.dest} → ACK ON")
-                        else:
-                            # Ensure we don't force ACKs on group/broadcast
-                            msg.ack_requested = False
-                            logger.debug(f"🔁 Remap DDNG→SDN: group/broadcast {msg.dest} → ACK OFF")
-
-                    # SDN → DDNG: preserve your existing mapping; no forced ACK here
-                    elif label == "SDN" and msg.dest == [0xFF, 0xFF, 0xF0]:
-                        msg.src_node_type = 2
-                        # Leave msg.ack_requested as-is (don’t force ACKs for broadcast)
-                except Exception as e:
-                    logger.error(f"⚠️ Remap error: {e}")
-                return msg
+            # SDN → DDNG: preserve your existing mapping; no forced ACK here
+            elif label == "SDN" and msg.dest == [0xFF, 0xFF, 0xF0]:
+                msg.src_node_type = 2
+                # Leave msg.ack_requested as-is (don’t force ACKs for broadcast)
+        except Exception as e:
+            logger.error(f"⚠️ Remap error: {e}")
+        return msg
 
 
 async def main():
