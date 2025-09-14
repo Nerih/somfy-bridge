@@ -26,3 +26,5 @@ SW_VER = os.getenv("SW_VER", "0.1a")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR")
 
+ACK_RETRY_INTERVAL = float(os.getenv("ACK_RETRY_INTERVAL", 0.1))   # 100ms default
+ACK_MAX_RETRIES    = int(os.getenv("ACK_MAX_RETRIES", 10))         # 10 retries

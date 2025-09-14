@@ -1,4 +1,5 @@
 import logging
+from typing import List
 logger = logging.getLogger("somfy_sdn")
 
 def parse_address(addr_string):
@@ -137,3 +138,18 @@ def node_type_to_number(type_input):
     except Exception:
         logger.exception(f"❌ node_type_to_number failed for input={type_input}")
     return 0x00
+
+
+# Add this helper (e.g., near the Bridge class)
+def is_unicast_non_group(dest: List[int]) -> bool:
+    """
+    Treat first 3 bytes of dest as a 20-bit-ish node address.
+    Return True for 0x000001–0x0FFFFF and False for group/broadcast (e.g., FF FF F*).
+    """
+    if not dest or len(dest) < 3:
+        return False
+    # Exclude broadcast/group like FF FF F0 / FF FF xx
+    if dest[0] == 0xFF and dest[1] == 0xFF:
+        return False
+    addr = (dest[0] << 16) | (dest[1] << 8) | dest[2]
+    return 0x000001 <= addr <= 0x0FFFFF
